@@ -12,8 +12,6 @@ devuelve un vector de 16384 valores en double con informacion de radios de los p
 
 #define NUM_POINTS 16384
 
-void print_cloud(FILE* document, float* cloud, const char* name);
-
 __global__
 void Conversion(float* r, unsigned long int* encoder_count, float* altitude, float* azimuth, float* point_cloud)
 {
@@ -39,6 +37,47 @@ void RyT(float* R, float* T, float* P, float* Q)
 	Q[0 + i * 3] = R[0 + 0 * 3] * P[0 + i * 3] + R[0 + 1 * 3] * P[1 + i * 3] + R[0 + 2 * 3] * P[2 + i * 3] + T[0];
 	Q[1 + i * 3] = R[1 + 0 * 3] * P[0 + i * 3] + R[1 + 1 * 3] * P[1 + i * 3] + R[1 + 2 * 3] * P[2 + i * 3] + T[1];
 	Q[2 + i * 3] = R[2 + 0 * 3] * P[0 + i * 3] + R[2 + 1 * 3] * P[1 + i * 3] + R[2 + 2 * 3] * P[2 + i * 3] + T[2];
+}
+
+__global__
+void Match(float* P, float* Q, int q_points, int* idx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	
+	float min = 100000;
+	float d;
+
+	float xp = P[0 + i * 3];
+	float yp = P[1 + i * 3];
+	float zp = P[2 + i * 3];
+
+	float xq, yq, zq;
+	int j;
+	for (j = 0; j < q_points / 2; j++)
+	{
+		xq = Q[0 + j * 3];
+		yq = Q[1 + j * 3];
+		zq = Q[2 + j * 3];
+		d = (xp - xq) * (xp - xq) + (yp - yq) * (yp - yq) + (zp - zq) * (zp - zq);
+		if (d < min)
+		{
+			min = d;
+			idx[i] = j;
+		}
+	}
+
+	for (j = j; j < q_points; j++)
+	{
+		xq = Q[0 + j * 3];
+		yq = Q[1 + j * 3];
+		zq = Q[2 + j * 3];
+		d = (xp - xq) * (xp - xq) + (yp - yq) * (yp - yq) + (zp - zq) * (zp - zq);
+		if (d < min)
+		{
+			min = d;
+			idx[i] = j;
+		}
+	}
 }
 
 int main(void)
@@ -144,9 +183,6 @@ int main(void)
 	}
 	fclose(document);
 
-	//for(i=0;i<16;i++) printf("%.3f\n",h_altitude[i]);
-	//for(i=0;i<16;i++) printf("%.3f\n",h_azimuth[i]);
-
 	///////End of Block 1///////
 
 	cudaEvent_t start, stop;
@@ -155,8 +191,9 @@ int main(void)
 	float milliseconds1 = 0;//for "Conversion"
 	float milliseconds2 = 0;//for "RyT"
 
-	int GridSize = 16;
-	int BlockSize = NUM_POINTS / GridSize;
+	//Optimize occupancy
+	int GridSize = 64;
+	int BlockSize = 256;
 
 	cudaError_t err = cudaSuccess;//for checking errors in kernels
 
@@ -244,16 +281,26 @@ int main(void)
 
 	cudaEventElapsedTime(&milliseconds2, start, stop);
 	printf("RyT kernel's elapsed time: %.3f ms\n", milliseconds2);
-
-	//move data back to the CPU
-	cudaMemcpy(h_P, d_P, 3 * bytes_r, cudaMemcpyDeviceToHost);
-	cudaMemcpy(h_Q, d_Q, 3 * bytes_r, cudaMemcpyDeviceToHost);
-
 	///////End of Block 3///////
 
-	/*Print clouds into a file*/
-	print_cloud(document, h_P, "GPU_Output_file_P.csv");
-	print_cloud(document, h_Q, "GPU_Output_file_Q.csv");
+	///////Block 4: Match///////
+	int* d_idx;
+	cudaMalloc(&d_idx, NUM_POINTS*sizeof(int));
+	
+	cudaEventRecord(start);
+	
+	Match << <GridSize, BlockSize >> > (d_P, d_Q, NUM_POINTS, d_idx);
+	
+	err = cudaGetLastError();
+	if (err != cudaSuccess) printf("Error in Match kernel: %s\n", cudaGetErrorString(err));
+	cudaDeviceSynchronize();
+
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds2, start, stop);
+	printf("Match kernel's elapsed time: %.3f ms\n", milliseconds2);
+	
+	///////End of Block 4///////
 
 	printf("Success!\n");
 
@@ -264,22 +311,7 @@ int main(void)
 	cudaFree(d_T), cudaFree(d_R);
 	free(h_r), free(h_altitude), free(h_azimuth);
 	cudaFree(d_r), cudaFree(d_altitude), cudaFree(d_azimuth), cudaFree(d_encoder_count);
+	cudaFree(d_idx);
 	
 	return 0;
-}
-
-void print_cloud(FILE* document, float* cloud, const char* name)
-{
-	int i, j;
-	fopen_s(&document, name, "w");
-	if (!document) printf("Error: File opening failed\n");
-
-	for (i = 0; i < NUM_POINTS; i++)
-	{
-		for (j = 0; j < 2; j++) fprintf(document, "%.3f, ", cloud[j + i * 3]);
-		fprintf(document, "%.3f\n ", cloud[j + i * 3]);
-	}
-	fprintf(document, "\n");
-
-	fclose(document);
 }
